@@ -1,22 +1,20 @@
 /* 
 The issue:
-1. A job is in planned
+1. A job is in planning
 2. A job is moved to Soft Allocated status (ja.jobStatus = 13)
-3. The job is out of planning
+3. The job is missed out of planning
 
 Solution:
-1. Find jobs which were planned
+1. Find jobs which were planned since the dedicated @startDate period
 2. Find out duration between two consecutive planning executions
 3. Filter out jobs which planned longer than pauseInMinutesBetweenAllocations interval
-4. Filter out jobs which were Soft Allocated and then stopper to plan
+4. Filter out jobs which were Soft Allocated and then stopped to add in planning: (DATEDIFF(second, r.timestamp, p.nextPlanningExecution) > DATEDIFF(second, p.planningTimestamp, r.timestamp)
+
+Result:
+This script allowed to find out why jobs are missed out from planning and prepare fix for that
 */
 
 
-Вариант решения:
-1. Работа была в планировании
-2. Работа пропадает из планирования
-3. Отфильтровываем работы которые не планировались дольше diffExecutions
-4. Отфильтровываем работы, которые словили Soft Allocated и перестали планироваться (r.timestamp > p.planningTimestamp) и (DATEDIFF(second, r.timestamp, p.nextPlanningExecution) > DATEDIFF(second, p.planningTimestamp, r.timestamp)
 
 DECLARE @startDate date = DATEADD(day,DATEDIFF(day, 1, GETDATE()), 0) -- since yesterday
 DECLARE @pauseInMinutesBetweenAllocations int = 10;
