@@ -1,0 +1,210 @@
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-2.0.xsd">
+    <changeSet id="1" author="product" runOnChange="true">
+        <sql>
+            IF EXISTS(SELECT *
+                      FROM sys.objects
+                      WHERE object_id = OBJECT_ID(N'[dbo].[getDriverStatistics]') AND
+                            type IN (N'P', N'FN', N'IF', N'TF', N'FS', N'FT'))
+                DROP PROCEDURE [dbo].[getDriverStatistics]
+        </sql>
+        <sql>
+            <![CDATA[
+create procedure [dbo].[getDriverStatistics]
+	@DateFrom date,
+	@DateTo date,
+	@Depot numeric(19,0),
+	@Driver numeric(19,0),
+	@Service numeric(19,0),
+	@VehicleType numeric(19,0)
+as
+begin
+
+set datefirst 1
+
+declare @vDateFrom date = @DateFrom
+declare @vDateTo date = dateadd(day,1,@DateTo)
+declare @vDepot numeric(19,0) = @Depot
+declare @vDriver numeric(19,0) = @Driver
+declare @vService numeric(19,0) = @Service
+declare @vVehicleType numeric(19,0) = @VehicleType
+
+declare @DateFromWeekStart date = dateadd(weekday, 1 - datepart(weekday,@DateFrom), @DateFrom)
+declare @DateToWeekEnd date = dateadd(day, 1, dateadd(weekday, 7 - datepart(weekday,@DateTo), @DateTo))
+
+;with
+filtered_jobs as (
+	select
+		j.id job_id,
+		j.jobDate,
+		j.mopStatus,
+		j.pricing_result_id,
+		j.charging_result_id,
+		j.driver_id,
+		case when j.jobStatus = 7 then 1 else 0 end is_completed,
+        case when j.jobStatus = 9 then 1 else 0 end is_cancelled,
+        case when j.jobStatus = 10 then 1 else 0 end is_coa,
+		j.totalCharge,
+		row_number() over (partition by j.driver_id order by (select 1)) row_number,
+        d.callsign,
+	    d.fullName
+	from jobs j
+	join drivers d on j.driver_id = d.id
+	left join vehicles v on d.vehicle_id = v.id
+	left join models m on v.model_id = m.id
+	where
+		j.jobStatus in (7,9,10)
+        and j.jobDate > @vDateFrom
+		and j.jobDate < @vDateTo
+		and j.partner_id is null
+		and (@vDepot = -1 or j.depot_id = @vDepot)
+		and (@vDriver = -1 or j.driver_id = @vDriver)
+		and (@vService = -1 or j.service_id = @vService)
+		and (@vVehicleType = -1 or m.vehicle_type_id = @vVehicleType)
+),
+
+pricing as (
+	select
+		fj.job_id,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 14 then isnull(jcdl.net,0) else 0 end) hotelFare,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 1 then isnull(jcdl.net,0) else 0 end) generalFare,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 12 then isnull(jcdl.net,0) else 0 end) cardSurcharge,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 17 then isnull(jcdl.net,0) else 0 end) extras,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 16 then isnull(jcdl.net,0) else 0 end) waiting,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 15 then isnull(jcdl.net,0) else 0 end) discount,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId in (1,15,16,17,18) then isnull(jcdl.net,0) else 0 end) fare,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 18 then isnull(jcdl.net,0) else 0 end) coa
+	from filtered_jobs fj
+	join job_calculation_detail_line jcdl on fj.pricing_result_id = jcdl.calculation_result_id
+	where
+        jcdl.applied = 1
+    group by
+        fj.job_id
+),
+
+charging as (
+	select
+		fj.job_id,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 8 then isnull(jcdl.net,0) else 0 end) dsFare,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 14 then isnull(jcdl.net,0) else 0 end) hotelFare,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 10 then isnull(jcdl.net,0) else 0 end) dsCommission,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 7 then isnull(jcdl.net,0) else 0 end) dsVat,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId = 9 then isnull(jcdl.net,0) else 0 end) dsParking,
+		sum(case when fj.is_cancelled = 0 and jcdl.classificationId in (6,11) then isnull(jcdl.net,0) else 0 end) dsTips
+	from filtered_jobs fj
+	join job_calculation_detail_line jcdl on fj.charging_result_id = jcdl.calculation_result_id
+	where
+        jcdl.applied = 1
+    group by
+        fj.job_id
+),
+
+filtered_rejected_jobs as (
+	select
+		rj.driver_id,
+		count(*) rejected
+	from rejected_jobs rj
+	where
+		rj.reject_date > @vDateFrom
+		and rj.reject_date < @vDateTo
+	group by
+		rj.driver_id
+),
+
+driver_time as (
+    select
+        mpp.driver_id,
+        sum(case when mpp.type = 'ONLINE' then datediff(minute, actualTime.timeFrom, actualTime.timeTo) else 0 end) timeOnline,
+        sum(case when mpp.type = 'BREAK' then datediff(minute, actualTime.timeFrom, actualTime.timeTo) else 0 end) timeOnBreak,
+        0 timeOnlineBusy
+    from mc_mobile_presence_period mpp
+    outer apply (
+        select
+            case
+                when mpp.timeFrom < @vDateFrom
+                then @vDateFrom
+                else mpp.timeFrom
+            end timeFrom,
+            case
+                when mpp.timeTo > @vDateTo
+                then @vDateTo
+                else mpp.timeTo
+            end timeTo
+    ) actualTime
+    where
+        mpp.timeFrom between @vDateFrom and @vDateTo
+        or mpp.timeTo between @vDateFrom and @vDateTo
+    group by
+        mpp.driver_id
+),
+
+driver_pay as (
+	select
+		d.id driver_id,
+		sum(case when dba.chargeType = 0 then -dba.totalValue else 0 end) deductions,
+		sum(case when dba.chargeType = 1 then dba.totalValue else 0 end) credits
+	from driver_balance_action dba
+	join drivers d on dba.driver_balance_id = d.driver_balance_id
+	where
+		dba.apply_date >= @DateFromWeekStart
+		and dba.apply_date < @DateToWeekEnd
+	group by
+		d.id
+)
+
+select
+	fj.job_id,
+	fj.jobDate,
+	fj.callsign,
+	fj.fullName driverName,
+	isnull(case
+		when fj.mopStatus = 'CASH_TYPE'
+		then - c.dsFare - p.hotelFare - c.hotelFare
+		else p.generalFare + p.extras + p.waiting + p.discount + p.coa - c.dsFare
+	end,0) driverCom,
+	isnull(c.dsCommission,0) customerCom,
+	isnull(p.extras, 0) extras,
+	isnull(p.waiting, 0) waiting,
+	isnull(p.discount, 0) discount,
+	isnull(p.fare, 0) fare,
+	isnull(p.coa, 0) coa,
+	isnull(c.dsVat, 0) dsVat,
+	isnull(c.dsParking, 0) dsParking,
+	isnull(p.cardSurcharge, 0) cardSurcharge,
+	isnull(c.dsTips, 0) dsTips,
+	isnull(case
+	    when fj.is_cancelled = 0
+	    then fj.totalCharge - c.dsCommission - c.dsVat - c.dsTips - c.dsParking - c.hotelFare - c.dsFare
+	    else 0
+	end,0) otherAmounts,
+	isnull(case
+		when fj.mopStatus = 'CASH_TYPE'
+		then p.generalFare + p.coa + c.dsFare + c.dsVat
+		else c.dsFare + c.dsVat
+	end,0) totalJobsEarnings,
+	fj.is_completed,
+	fj.is_cancelled,
+	fj.is_coa,
+	isnull(frj.rejected,0) rejected,
+	isnull(dt.timeOnline,0) timeOnline,
+	isnull(dt.timeOnlineBusy,0) timeOnlineBusy,
+	isnull(dt.timeOnBreak,0) timeOnBreak,
+	isnull(dp.credits,0) credits,
+	isnull(dp.deductions,0) deductions
+from filtered_jobs fj
+left join pricing p on fj.job_id = p.job_id
+left join charging c on fj.job_id = c.job_id
+left join filtered_rejected_jobs frj on fj.driver_id = frj.driver_id and fj.row_number = 1
+left join driver_time dt on fj.driver_id = dt.driver_id and fj.row_number = 1
+left join driver_pay dp on fj.driver_id = dp.driver_id and fj.row_number = 1
+order by
+	fj.callsign
+
+end
+            ]]>
+        </sql>
+    </changeSet>
+</databaseChangeLog>
